@@ -16,6 +16,9 @@ export const geminiService = {
     }
 
     const ai = new GoogleGenAI({ apiKey });
+    const attendancePercentage = stats.totalStudents > 0
+      ? ((stats.presentCount / stats.totalStudents) * 100).toFixed(1)
+      : '0.0';
     
     const prompt = `
       As an academic administrator, analyze the following attendance data for a class session:
@@ -24,7 +27,7 @@ export const geminiService = {
       - Total Students: ${stats.totalStudents}
       - Present: ${stats.presentCount}
       - Absent: ${stats.absentCount}
-      - Attendance Percentage: ${((stats.presentCount / stats.totalStudents) * 100).toFixed(1)}%
+      - Attendance Percentage: ${attendancePercentage}%
 
       Provide a concise summary (max 3 sentences) including:
       1. An assessment of the attendance level.

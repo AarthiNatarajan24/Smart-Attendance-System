@@ -25,6 +25,44 @@ interface FaceBox {
 }
 
 const LIVENESS_THRESHOLD = 8; // Number of stable frames required
+const SCANNER_AVOID_CAMERA_LABEL_PATTERN = /infrared|ir camera|depth|hello|virtual|obs|snap camera|droidcam|epoccam/i;
+const SCANNER_PREFERRED_CAMERA_LABEL_PATTERNS = [/integrated/i, /webcam/i, /\bcamera\b/i, /front/i, /hd/i, /usb/i];
+
+const scoreScannerCameraLabel = (label: string): number => {
+  const normalizedLabel = label.trim();
+  if (!normalizedLabel) return 0;
+
+  let score = SCANNER_AVOID_CAMERA_LABEL_PATTERN.test(normalizedLabel) ? -100 : 0;
+  SCANNER_PREFERRED_CAMERA_LABEL_PATTERNS.forEach((pattern, index) => {
+    if (pattern.test(normalizedLabel)) {
+      score += 12 - index;
+    }
+  });
+
+  return score;
+};
+
+const listScannerVideoDevices = async (): Promise<MediaDeviceInfo[]> => {
+  if (!navigator.mediaDevices?.enumerateDevices) return [];
+
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices.filter(device => device.kind === 'videoinput');
+  } catch {
+    return [];
+  }
+};
+
+const findPreferredScannerVideoDevice = async (excludedIds: string[] = []): Promise<MediaDeviceInfo | null> => {
+  const devices = (await listScannerVideoDevices()).filter(device => !excludedIds.includes(device.deviceId));
+  if (devices.length === 0) return null;
+
+  return [...devices].sort((a, b) => {
+    const scoreDifference = scoreScannerCameraLabel(b.label) - scoreScannerCameraLabel(a.label);
+    if (scoreDifference !== 0) return scoreDifference;
+    return a.label.localeCompare(b.label);
+  })[0];
+};
 
 const FaceScanner: React.FC<FaceScannerProps> = ({ 
   onFaceDetected, 
@@ -63,7 +101,18 @@ const FaceScanner: React.FC<FaceScannerProps> = ({
     activeRef.current = true;
     
     try {
+      const preferredDevice = await findPreferredScannerVideoDevice();
       const constraintFallbacks: MediaStreamConstraints[] = [
+        ...(preferredDevice ? [
+          {
+            video: {
+              deviceId: { exact: preferredDevice.deviceId },
+              width: { ideal: 640 },
+              height: { ideal: 480 }
+            } as any,
+            audio: false
+          }
+        ] : []),
         {
           video: {
             facingMode: 'user',
@@ -100,10 +149,30 @@ const FaceScanner: React.FC<FaceScannerProps> = ({
       
       // Try to apply continuous focus if supported
       const track = stream.getVideoTracks()[0];
-      const capabilities = track.getCapabilities() as any;
+      const trackLabel = track?.label || '';
+      const trackDeviceId = track?.getSettings?.().deviceId;
+
+      if (trackLabel && SCANNER_AVOID_CAMERA_LABEL_PATTERN.test(trackLabel)) {
+        const alternateDevice = await findPreferredScannerVideoDevice(trackDeviceId ? [trackDeviceId] : []);
+
+        if (alternateDevice && !SCANNER_AVOID_CAMERA_LABEL_PATTERN.test(alternateDevice.label)) {
+          stream.getTracks().forEach(currentTrack => currentTrack.stop());
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              deviceId: { exact: alternateDevice.deviceId },
+              width: { ideal: 640 },
+              height: { ideal: 480 }
+            } as any,
+            audio: false
+          });
+        }
+      }
+
+      const activeTrack = stream.getVideoTracks()[0];
+      const capabilities = activeTrack.getCapabilities() as any;
       if (capabilities.focusMode && capabilities.focusMode.includes('continuous')) {
         try {
-          await track.applyConstraints({
+          await activeTrack.applyConstraints({
             advanced: [{ focusMode: 'continuous' }]
           } as any);
           console.log("Hardware continuous focus engaged.");
@@ -152,22 +221,27 @@ const FaceScanner: React.FC<FaceScannerProps> = ({
     }
   }, [stopCamera]);
 
+  const initModels = useCallback(async () => {
+    setError(null);
+
+    try {
+      await faceRecognitionService.loadModels();
+      setIsModelReady(true);
+    } catch (err) {
+      console.error('Face model initialization failed:', err);
+      setIsModelReady(false);
+      setError({
+        type: 'MODEL_LOAD',
+        message: "AI Core Failure",
+        tips: ["Check your internet connection", "Click 'Reload AI Core' to try again"]
+      });
+    }
+  }, []);
+
   useEffect(() => {
-    const initModels = async () => {
-      try {
-        await faceRecognitionService.loadModels();
-        setIsModelReady(true);
-      } catch (err) {
-        setError({
-          type: 'MODEL_LOAD',
-          message: "AI Core Failure",
-          tips: ["Check your internet connection", "Refresh the page"]
-        });
-      }
-    };
     initModels();
     return () => stopCamera();
-  }, [stopCamera]);
+  }, [initModels, stopCamera]);
 
   useEffect(() => {
     if (enabled && !isCameraReady && !error && isModelReady) {
@@ -398,10 +472,10 @@ const FaceScanner: React.FC<FaceScannerProps> = ({
             ))}
           </div>
           <button 
-            onClick={setupCamera} 
+            onClick={error.type === 'MODEL_LOAD' ? initModels : setupCamera} 
             className="pointer-events-auto px-10 py-4 bg-white text-slate-950 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-cyan-400 transition-all shadow-xl active:scale-95"
           >
-            Retry Access
+            {error.type === 'MODEL_LOAD' ? 'Reload AI Core' : 'Retry Access'}
           </button>
         </div>
       )}

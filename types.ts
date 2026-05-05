@@ -18,9 +18,11 @@ export interface TimetableEntry {
   id: string;
   subject: string;
   department: string;
+  enrollmentYear?: number; // Optional batch filter for the class
   startTime: string; // HH:mm
   endTime: string;   // HH:mm
   dayOfWeek: string;
+  calendarDate?: string; // YYYY-MM-DD
 }
 
 export interface PresenceCheck {

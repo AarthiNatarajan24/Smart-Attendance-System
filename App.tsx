@@ -2,18 +2,61 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { AuthMode, AuthState, AdminProfile, Student } from './types';
 import FaceScanner from './components/FaceScanner';
 import Dashboard from './components/Dashboard';
-import { DEPARTMENTS } from './constants';
+import { DEPARTMENTS, ENROLLMENT_YEARS } from './constants';
 import { faceRecognitionService } from './services/faceRecognitionService';
 import { sqliteService } from './services/sqliteService';
 
 const ADMIN_MATCH_THRESHOLD = 0.94;
 const ADMIN_REQUIRED_CONSECUTIVE_MATCHES = 2;
-const STUDENT_DUP_FACE_THRESHOLD = 0.93;
+// Lower distance => more similar. Tightened to reduce false duplicate flags.
+const STUDENT_DUP_FACE_DISTANCE = 0.42;
+const STUDENT_DUP_FACE_COSINE = 0.95;
+const STUDENT_DUP_DISTANCE_MARGIN = 0.12; // gap to second-best distance required to call it a duplicate
 const MAX_INTRUDER_ATTEMPTS = 3;
 const INTRUDER_LOCK_MS = 30000;
 const FALLBACK_ADMIN_RECOVERY_EMAIL = 'lishibora24@gmail.com';
 
 const isValidGmail = (email: string) => /^[^\s@]+@gmail\.com$/i.test(email.trim());
+type NewStudentForm = { name: string; registerNumber: string; department: string; enrollmentYear: string };
+type RegisteredFaceCandidate = {
+  kind: 'student' | 'admin';
+  name: string;
+  descriptor: Float32Array;
+  registerNumber?: string;
+  department?: string;
+};
+type RegisteredFaceMatch = {
+  candidate: RegisteredFaceCandidate;
+  distance: number;
+  cosine: number;
+};
+
+const findRegisteredFaceMatch = (
+  descriptor: Float32Array,
+  candidates: RegisteredFaceCandidate[]
+): RegisteredFaceMatch | null => {
+  const rankedMatches = candidates
+    .map(candidate => ({
+      candidate,
+      distance: faceRecognitionService.calculateEuclideanDistance(descriptor, candidate.descriptor),
+      cosine: faceRecognitionService.calculateCosineSimilarity(descriptor, candidate.descriptor)
+    }))
+    .filter(match => Number.isFinite(match.distance) && Number.isFinite(match.cosine))
+    .sort((a, b) => {
+      if (a.distance !== b.distance) return a.distance - b.distance;
+      return b.cosine - a.cosine;
+    });
+
+  const bestMatch = rankedMatches[0];
+  if (!bestMatch) return null;
+
+  return (
+    bestMatch.distance <= STUDENT_DUP_FACE_DISTANCE &&
+    bestMatch.cosine >= STUDENT_DUP_FACE_COSINE
+  )
+    ? bestMatch
+    : null;
+};
 
 const App: React.FC = () => {
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
@@ -50,7 +93,7 @@ const App: React.FC = () => {
   const [storedAdmin, setStoredAdmin] = useState<AdminProfile | null>(null);
   const [isDbReady, setIsDbReady] = useState(false);
   
-  const [newStudent, setNewStudent] = useState<Partial<Student>>({ name: '', registerNumber: '', department: '' });
+  const [newStudent, setNewStudent] = useState<NewStudentForm>({ name: '', registerNumber: '', department: '', enrollmentYear: '' });
   const [successToast, setSuccessToast] = useState<{ name: string; id: string } | null>(null);
 
   useEffect(() => {
@@ -126,7 +169,7 @@ const App: React.FC = () => {
         isValidGmail(adminRecoveryEmailInput)
       )
     )) ||
-    (isDbReady && mode === AuthMode.TEST && newStudent.name && newStudent.name.trim().length > 2 && newStudent.registerNumber && newStudent.registerNumber.trim().length > 2 && newStudent.department)
+    (isDbReady && mode === AuthMode.TEST && newStudent.name && newStudent.name.trim().length > 2 && newStudent.registerNumber && newStudent.registerNumber.trim().length > 2 && newStudent.department && newStudent.enrollmentYear)
   );
 
   useEffect(() => {
@@ -150,9 +193,9 @@ const App: React.FC = () => {
       }
     } else {
       setStatus(
-        newStudent.name && newStudent.registerNumber && newStudent.department
+        newStudent.name && newStudent.registerNumber && newStudent.department && newStudent.enrollmentYear
           ? 'Position Face in Frame'
-          : 'Enter Name, Register Number, and Department'
+          : 'Enter Name, Register Number, Department, and Year'
       );
     }
   }, [mode, adminNameInput, adminRecoveryInput, adminRecoveryEmailInput, storedAdmin, newStudent, isRecoveryActive, isDbReady]);
@@ -195,6 +238,15 @@ const App: React.FC = () => {
           setAdminMatchStreak(0);
           setLockoutUntil(null);
         } else {
+          if (!faceRecognitionService.isStoredDescriptorCompatible(storedAdmin.faceDescription)) {
+            const storedAdminDescriptor = faceRecognitionService.describeStoredDescriptor(storedAdmin.faceDescription);
+            setStatus(
+              `Admin profile uses ${faceRecognitionService.getEngineLabel(storedAdminDescriptor.engine)}. InsightFace is disabled, so re-enroll this profile with face-api.`
+            );
+            await new Promise(r => setTimeout(r, 2500));
+            return;
+          }
+
           const storedDescriptor = faceRecognitionService.deserializeDescriptor(storedAdmin.faceDescription);
           const similarity = faceRecognitionService.calculateCosineSimilarity(descriptor, storedDescriptor);
           
@@ -214,18 +266,27 @@ const App: React.FC = () => {
             setAdminMatchStreak(0);
             // Only if it's NOT the admin face, check if it matches any student and block those.
             const enrolledStudents = await sqliteService.getStudents();
-            const bestStudentMatch = enrolledStudents
+            const studentMatches = enrolledStudents
               .filter(studentRecord => !!studentRecord.faceDescription)
               .map(studentRecord => {
                 const existingDescriptor = faceRecognitionService.deserializeDescriptor(studentRecord.faceDescription!);
-                const similarityToStudent = faceRecognitionService.calculateCosineSimilarity(descriptor, existingDescriptor);
-                return { student: studentRecord, similarity: similarityToStudent };
+                const distanceToStudent = faceRecognitionService.calculateEuclideanDistance(descriptor, existingDescriptor);
+                const cosineToStudent = faceRecognitionService.calculateCosineSimilarity(descriptor, existingDescriptor);
+                return { student: studentRecord, distance: distanceToStudent, cosine: cosineToStudent };
               })
-              .sort((a, b) => b.similarity - a.similarity)[0];
+              .filter(match => Number.isFinite(match.distance) && Number.isFinite(match.cosine))
+              .sort((a, b) => a.distance - b.distance);
+
+            const [bestStudentMatch, secondStudentMatch] = studentMatches;
 
             const nextAttempts = intruderAttempts + 1;
 
-            if (bestStudentMatch && bestStudentMatch.similarity >= STUDENT_DUP_FACE_THRESHOLD) {
+            if (
+              bestStudentMatch &&
+              bestStudentMatch.distance <= STUDENT_DUP_FACE_DISTANCE &&
+              bestStudentMatch.cosine >= STUDENT_DUP_FACE_COSINE &&
+              (!secondStudentMatch || secondStudentMatch.distance - bestStudentMatch.distance >= STUDENT_DUP_DISTANCE_MARGIN)
+            ) {
               if (nextAttempts >= MAX_INTRUDER_ATTEMPTS) {
                 const lockUntil = Date.now() + INTRUDER_LOCK_MS;
                 setLockoutUntil(lockUntil);
@@ -253,19 +314,85 @@ const App: React.FC = () => {
         const studentName = newStudent.name!.trim();
         const registerNumber = newStudent.registerNumber!.trim().toUpperCase();
         const department = newStudent.department!.trim();
+        const enrollmentYear = Number(newStudent.enrollmentYear);
+        if (!ENROLLMENT_YEARS.includes(enrollmentYear)) {
+          setStatus('Select a valid enrollment year');
+          await new Promise(r => setTimeout(r, 1500));
+          return;
+        }
         const existingStudents = await sqliteService.getStudents();
 
-        const existingFaceMatch = existingStudents
-          .filter(studentRecord => !!studentRecord.faceDescription)
+        const incompatibleBiometricOwner = (
+          storedAdmin?.faceDescription && !faceRecognitionService.isStoredDescriptorCompatible(storedAdmin.faceDescription)
+        )
+          ? {
+              label: `${storedAdmin.name} / Admin Profile`,
+              engine: faceRecognitionService.describeStoredDescriptor(storedAdmin.faceDescription).engine
+            }
+          : existingStudents
+              .filter(studentRecord => !!studentRecord.faceDescription)
+              .map(studentRecord => ({
+                studentRecord,
+                compatible: faceRecognitionService.isStoredDescriptorCompatible(studentRecord.faceDescription!)
+              }))
+              .find(entry => !entry.compatible)
+              ? {
+                  label: `${existingStudents
+                    .filter(studentRecord => !!studentRecord.faceDescription)
+                    .find(studentRecord => !faceRecognitionService.isStoredDescriptorCompatible(studentRecord.faceDescription!))!.name} / Existing Student Record`,
+                  engine: faceRecognitionService.describeStoredDescriptor(
+                    existingStudents
+                      .filter(studentRecord => !!studentRecord.faceDescription)
+                      .find(studentRecord => !faceRecognitionService.isStoredDescriptorCompatible(studentRecord.faceDescription!))!
+                      .faceDescription!
+                  ).engine
+                }
+              : null;
+
+        if (incompatibleBiometricOwner) {
+          setStatus(
+            `Registration blocked: ${incompatibleBiometricOwner.label} uses ${faceRecognitionService.getEngineLabel(incompatibleBiometricOwner.engine)}. InsightFace is disabled, so re-enroll that record with face-api first.`
+          );
+          await new Promise(r => setTimeout(r, 2500));
+          return;
+        }
+
+        const registeredFaceCandidates: RegisteredFaceCandidate[] = existingStudents
+          .filter(studentRecord => !!studentRecord.faceDescription && faceRecognitionService.isStoredDescriptorCompatible(studentRecord.faceDescription!))
           .map(studentRecord => {
             const existingDescriptor = faceRecognitionService.deserializeDescriptor(studentRecord.faceDescription!);
-            const similarity = faceRecognitionService.calculateCosineSimilarity(descriptor, existingDescriptor);
-            return { student: studentRecord, similarity };
-          })
-          .sort((a, b) => b.similarity - a.similarity)[0];
+            return {
+              kind: 'student' as const,
+              name: studentRecord.name,
+              registerNumber: studentRecord.registerNumber,
+              department: studentRecord.department,
+              descriptor: existingDescriptor
+            };
+          });
 
-        if (existingFaceMatch && existingFaceMatch.similarity >= STUDENT_DUP_FACE_THRESHOLD) {
-          setStatus(`Registration blocked: Face already exists (${existingFaceMatch.student.name} / ${existingFaceMatch.student.registerNumber})`);
+        if (storedAdmin?.faceDescription) {
+          registeredFaceCandidates.push({
+            kind: 'admin',
+            name: storedAdmin.name,
+            descriptor: faceRecognitionService.deserializeDescriptor(storedAdmin.faceDescription)
+          });
+        }
+
+        const existingFaceMatch = findRegisteredFaceMatch(descriptor, registeredFaceCandidates);
+
+        if (existingFaceMatch) {
+          const { candidate, distance, cosine } = existingFaceMatch;
+          const matchedIdentity = candidate.kind === 'student'
+            ? `${candidate.name} / ${candidate.registerNumber} / ${candidate.department}`
+            : `${candidate.name} / Admin Profile`;
+          console.warn('Student enrollment blocked: registered face detected', {
+            kind: candidate.kind,
+            name: candidate.name,
+            registerNumber: candidate.registerNumber ?? null,
+            distance: distance.toFixed(3),
+            cosine: cosine.toFixed(3)
+          });
+          setStatus(`Registration blocked: Face already registered (${matchedIdentity}) [distance ${distance.toFixed(3)} | cosine ${cosine.toFixed(3)}]`);
           await new Promise(r => setTimeout(r, 2000));
           return;
         }
@@ -294,14 +421,23 @@ const App: React.FC = () => {
           name: studentName,
           email: `${studentName.toLowerCase().replace(/\s/g, '.')}@uni.ac.in`,
           department,
-          enrollmentYear: new Date().getFullYear(),
+          enrollmentYear,
           status: 'Present',
           faceDescription: faceRecognitionService.serializeDescriptor(descriptor)
         };
         await sqliteService.addStudent(student);
         
+        // Ensure biometric payload persisted; if not, roll back and prompt retry.
+        const savedRecord = (await sqliteService.getStudents()).find(s => s.id === student.id);
+        if (!savedRecord?.faceDescription) {
+          await sqliteService.deleteStudentById(student.id);
+          setStatus('Registration failed: biometric capture did not persist. Please retry.');
+          await new Promise(r => setTimeout(r, 2000));
+          return;
+        }
+        
         setSuccessToast({ name: student.name, id: student.id });
-        setNewStudent({ name: '', registerNumber: '', department: '' });
+        setNewStudent({ name: '', registerNumber: '', department: '', enrollmentYear: '' });
         
         await new Promise(r => setTimeout(r, 3000));
         setSuccessToast(null);
@@ -339,7 +475,7 @@ const App: React.FC = () => {
     setNewRecoveryPasswordInput('');
     setConfirmRecoveryPasswordInput('');
     setRecoveryError('');
-    setNewStudent({ name: '', registerNumber: '', department: '' });
+    setNewStudent({ name: '', registerNumber: '', department: '', enrollmentYear: '' });
     setIntruderAttempts(0);
     setAdminMatchStreak(0);
     setLockoutUntil(null);
@@ -730,6 +866,19 @@ const App: React.FC = () => {
                      >
                        <option value="">Select Department</option>
                        {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
+                     </select>
+                  </div>
+                  <div className="group relative">
+                     <div className="absolute inset-y-0 left-0 pl-6 flex items-center pointer-events-none text-slate-400 dark:text-slate-600 group-focus-within:text-indigo-500 transition-colors">
+                        <i className="fa-solid fa-calendar"></i>
+                     </div>
+                     <select
+                      value={newStudent.enrollmentYear || ''}
+                      onChange={e => setNewStudent({...newStudent, enrollmentYear: e.target.value})}
+                      className="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-white/5 py-5 pl-14 pr-6 rounded-[2rem] text-slate-500 dark:text-slate-400 font-bold outline-none appearance-none cursor-pointer focus:ring-1 focus:ring-indigo-500/30 shadow-sm transition-all"
+                     >
+                       <option value="">Select Enrollment Year</option>
+                       {ENROLLMENT_YEARS.map(y => <option key={y} value={y}>{y}</option>)}
                      </select>
                   </div>
                 </div>

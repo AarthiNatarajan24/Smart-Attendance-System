@@ -4,13 +4,16 @@ import { Student, TimetableEntry } from './types';
 export const DEPARTMENTS = [
   'Computer Science Engineering',
   'Information Technology',
+  'Civil',
   'EEE',
   'ECE',
   'Biotech',
   'Pharma',
   'Petrochemical',
-  'Automobile'
+  'Automobile',
 ];
+
+export const ENROLLMENT_YEARS = [2022, 2023, 2024, 2025, 2026];
 
 export const MOCK_STUDENTS: Student[] = [
   { id: 'STU001', registerNumber: 'CSE24001', name: 'Alice Johnson', email: 'alice.j@uni.edu', department: 'Computer Science Engineering', enrollmentYear: 2024, status: 'Present' },
@@ -19,9 +22,9 @@ export const MOCK_STUDENTS: Student[] = [
 ];
 
 export const MOCK_TIMETABLE: TimetableEntry[] = [
-  { id: 'T1', subject: 'Advanced AI Systems', department: 'Computer Science Engineering', startTime: '08:00', endTime: '09:00', dayOfWeek: 'Monday' },
-  { id: 'T2', subject: 'Digital Signal Processing', department: 'ECE', startTime: '09:30', endTime: '10:30', dayOfWeek: 'Monday' },
-  { id: 'T3', subject: 'Power Electronics', department: 'EEE', startTime: '11:00', endTime: '12:30', dayOfWeek: 'Tuesday' },
+  { id: 'T1', subject: 'Advanced AI Systems', department: 'Computer Science Engineering', enrollmentYear: 2024, startTime: '08:00', endTime: '09:00', dayOfWeek: 'Monday' },
+  { id: 'T2', subject: 'Digital Signal Processing', department: 'ECE', enrollmentYear: 2023, startTime: '09:30', endTime: '10:30', dayOfWeek: 'Monday' },
+  { id: 'T3', subject: 'Power Electronics', department: 'EEE', enrollmentYear: 2024, startTime: '11:00', endTime: '12:30', dayOfWeek: 'Tuesday' },
 ];
 
 export const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];

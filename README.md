@@ -18,3 +18,7 @@ View your app in AI Studio: https://ai.studio/apps/faf585f0-b7c7-4902-8e8d-e58ff
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
 3. Run the app:
    `npm run dev`
+
+## Biometric Engine
+
+The app currently uses `face-api` for biometric enrollment and recognition.
